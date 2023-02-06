@@ -1,6 +1,7 @@
 /* test.c
 
    Copyright (c) 2003-2022 HandBrake Team
+   Copyright (c) 2023 Nvidia Cooperation
    This file is part of the HandBrake source code
    Homepage: <http://handbrake.fr/>.
    It may be used under the terms of the GNU General Public License v2.
@@ -37,6 +38,9 @@
 #if HB_PROJECT_FEATURE_QSV
 #include "handbrake/qsv_common.h"
 #endif
+
+///TODO: remove dependency
+#include "handbrake/common.h"
 
 #if defined( __APPLE_CC__ )
 #import <CoreServices/CoreServices.h>
@@ -209,6 +213,7 @@ static int      qsv_adapter        = -1;
 static int      qsv_decode         = -1;
 #endif
 static int      hw_decode          = -1;
+static int      num_chunks         = 0;
 
 /* Exit cleanly on Ctrl-C */
 static volatile hb_error_code done_error = HB_ERROR_NONE;
@@ -336,7 +341,183 @@ static int get_argv_utf8(int *argc_ptr, char ***argv_ptr)
 #endif
 }
 
-static volatile int job_running = 0;
+static volatile int job_running[100] = {0};
+
+#include <libavformat/avformat.h>
+#include <libavutil/timestamp.h>
+#include <assert.h>
+
+// from remux.c ffmepg sample
+static int ffmpeg_remux(const char* in_filename, const char* out_filename, const char* input_format) {
+    const AVOutputFormat *ofmt = NULL;
+    AVFormatContext *ifmt_ctx = NULL, *ofmt_ctx = NULL;
+    const AVInputFormat *ifmt = NULL;
+    AVPacket *pkt = NULL;
+    int ret;
+    int stream_index = 0;
+    int *stream_mapping = NULL;
+    int stream_mapping_size = 0;
+
+    if (input_format) {
+        ifmt = av_find_input_format(input_format);
+    }
+
+    pkt = av_packet_alloc();
+    if (!pkt) {
+        fprintf(stderr, "Could not allocate AVPacket\n");
+        return 1;
+    }
+ 
+    if ((ret = avformat_open_input(&ifmt_ctx, in_filename, ifmt, 0)) < 0) {
+        fprintf(stderr, "Could not open input file '%s'", in_filename);
+        goto end;
+    }
+ 
+    if ((ret = avformat_find_stream_info(ifmt_ctx, 0)) < 0) {
+        fprintf(stderr, "Failed to retrieve input stream information");
+        goto end;
+    }
+ 
+    av_dump_format(ifmt_ctx, 0, in_filename, 0);
+ 
+    avformat_alloc_output_context2(&ofmt_ctx, NULL, NULL, out_filename);
+    if (!ofmt_ctx) {
+        fprintf(stderr, "Could not create output context\n");
+        ret = AVERROR_UNKNOWN;
+        goto end;
+    }
+ 
+    stream_mapping_size = ifmt_ctx->nb_streams;
+    stream_mapping = av_calloc(stream_mapping_size, sizeof(*stream_mapping));
+    if (!stream_mapping) {
+        ret = AVERROR(ENOMEM);
+        goto end;
+    }
+ 
+    ofmt = ofmt_ctx->oformat;
+ 
+    for (unsigned int i = 0; i < ifmt_ctx->nb_streams; i++) {
+        AVStream *out_stream;
+        AVStream *in_stream = ifmt_ctx->streams[i];
+        AVCodecParameters *in_codecpar = in_stream->codecpar;
+ 
+        if (in_codecpar->codec_type != AVMEDIA_TYPE_AUDIO &&
+            in_codecpar->codec_type != AVMEDIA_TYPE_VIDEO &&
+            in_codecpar->codec_type != AVMEDIA_TYPE_SUBTITLE) {
+            stream_mapping[i] = -1;
+            continue;
+        }
+ 
+        stream_mapping[i] = stream_index++;
+ 
+        out_stream = avformat_new_stream(ofmt_ctx, NULL);
+        if (!out_stream) {
+            fprintf(stderr, "Failed allocating output stream\n");
+            ret = AVERROR_UNKNOWN;
+            goto end;
+        }
+ 
+        ret = avcodec_parameters_copy(out_stream->codecpar, in_codecpar);
+        if (ret < 0) {
+            fprintf(stderr, "Failed to copy codec parameters\n");
+            goto end;
+        }
+        out_stream->codecpar->codec_tag = 0;
+    }
+    av_dump_format(ofmt_ctx, 0, out_filename, 1);
+ 
+    if (!(ofmt->flags & AVFMT_NOFILE)) {
+        ret = avio_open(&ofmt_ctx->pb, out_filename, AVIO_FLAG_WRITE);
+        if (ret < 0 && ret != AVERROR_EOF) {
+            fprintf(stderr, "Could not open output file '%s'\n", out_filename);
+            goto end;
+        }
+    }
+ 
+    ret = avformat_write_header(ofmt_ctx, NULL);
+    if (ret < 0) {
+        fprintf(stderr, "Error occurred when opening output file\n");
+        goto end;
+    }
+
+    while (1) {
+        AVStream *in_stream, *out_stream;
+ 
+        ret = av_read_frame(ifmt_ctx, pkt);
+        if (ret < 0) {
+            if (ret != AVERROR_EOF) {
+                fprintf(stderr, "Error occurred: %s\n", av_err2str(ret));
+            }
+            break;
+        }
+ 
+        in_stream  = ifmt_ctx->streams[pkt->stream_index];
+        if (pkt->stream_index >= stream_mapping_size ||
+            stream_mapping[pkt->stream_index] < 0) {
+            av_packet_unref(pkt);
+            continue;
+        }
+ 
+        pkt->stream_index = stream_mapping[pkt->stream_index];
+        out_stream = ofmt_ctx->streams[pkt->stream_index];
+
+        av_packet_rescale_ts(pkt, in_stream->time_base, out_stream->time_base);
+        pkt->pos = -1;
+
+        ret = av_interleaved_write_frame(ofmt_ctx, pkt);
+
+        if (ret < 0 ) {
+            fprintf(stderr, "Error muxing packet of stream %i: %s\n", pkt->stream_index, av_err2str(ret));
+            break;
+        }
+    }
+ 
+    av_write_trailer(ofmt_ctx);
+end:
+    av_packet_free(&pkt);
+ 
+    avformat_close_input(&ifmt_ctx);
+ 
+    /* close output */
+    if (ofmt_ctx && !(ofmt->flags & AVFMT_NOFILE))
+        avio_closep(&ofmt_ctx->pb);
+    avformat_free_context(ofmt_ctx);
+ 
+    av_freep(&stream_mapping);
+ 
+    if (ret < 0 && ret != AVERROR_EOF) {
+        fprintf(stderr, "Error occurred: %s\n", av_err2str(ret));
+        return 1;
+    }
+    return 0;
+}
+
+static int glueTogetherFragments(const char* output,  int num_chunks) {
+    int rtn = 0;
+    FILE* file_list = NULL;
+    /*char* tmp_filename = hb_get_temporary_filename();*/
+    char* tmp_filename = "tempfile_concat";
+
+    file_list = hb_fopen(tmp_filename, "w");
+    if(!file_list) {
+        rtn = 1;
+        goto cleanup;
+    }
+
+    for ( int i = 0; i < num_chunks; i++ ) {
+       fprintf(file_list, "file %s.%d.ts\n", output, i); 
+    }
+
+    fclose(file_list);
+    file_list = NULL;
+    rtn = ffmpeg_remux(tmp_filename, output, "concat");
+
+cleanup:
+    if(file_list) {
+        fclose(file_list);
+    }
+    return rtn;
+}
 
 void EventLoop(hb_handle_t *h, hb_dict_t *preset_dict)
 {
@@ -426,7 +607,117 @@ void EventLoop(hb_handle_t *h, hb_dict_t *preset_dict)
 
         HandleEvents( h, preset_dict );
     }
-    job_running = 0;
+    job_running[0] = 0;
+}
+
+void MultiEventLoop(hb_list_t *handle_list, hb_dict_t *preset_dict)
+{
+    /* Wait... */
+    work_done = 0;
+
+    hb_value_t* chunk_idx = hb_dict_get(preset_dict, "ChunkIndex");
+    while (!die && work_done < hb_list_count(handle_list))
+    {
+#if defined( __MINGW32__ )
+        if( _kbhit() ) {
+            switch( _getch() )
+            {
+                case 0x03: /* ctrl-c */
+                case 'q':
+                    fprintf( stdout, "\nEncoding Quit by user command\n" );
+                    done_error = HB_ERROR_CANCELED;
+                    die = 1;
+                    break;
+                case 'p':
+                    fprintf(stdout,
+                            "\nEncoding Paused by user command, 'r' to resume\n");
+                    for(int i = 0; i < hb_list_count(handle_list); i++) {
+                        hb_handle_t* h = hb_list_item(handle_list, i);
+                        hb_pause(h);
+                        hb_system_sleep_allow(h);
+                    }
+                    break;
+                case 'r':
+                    for(int i = 0; i < hb_list_count(handle_list); i++) {
+                        hb_handle_t* h = hb_list_item(handle_list, i);
+                        hb_system_sleep_prevent(h);
+                        hb_resume(h);
+                    }
+                    break;
+                case 'h':
+                    ShowCommands();
+                    break;
+            }
+        }
+#else
+        fd_set         fds;
+        struct timeval tv;
+        int            ret;
+        char           buf[257];
+
+        tv.tv_sec  = 0;
+        tv.tv_usec = 100000;
+
+        FD_ZERO( &fds );
+        FD_SET( STDIN_FILENO, &fds );
+        ret = select( STDIN_FILENO + 1, &fds, NULL, NULL, &tv );
+
+        if( ret > 0 )
+        {
+            int size = 0;
+
+            while( size < 256 &&
+                   read( STDIN_FILENO, &buf[size], 1 ) > 0 )
+            {
+                if( buf[size] == '\n' )
+                {
+                    break;
+                }
+                size++;
+            }
+
+            if( size >= 256 || buf[size] == '\n' )
+            {
+                switch( buf[0] )
+                {
+                    case 'q':
+                        fprintf( stdout, "\nEncoding Quit by user command\n" );
+                        done_error = HB_ERROR_CANCELED;
+                        die = 1;
+                        break;
+                    case 'p':
+                        fprintf(stdout,
+                                "\nEncoding Paused by user command, 'r' to resume\n");
+                        for(int i = 0; i < hb_list_count(handle_list); i++) {
+                            hb_handle_t* h = hb_list_item(handle_list, i);
+                            hb_pause(h);
+                            hb_system_sleep_allow(h);
+                        }
+                        break;
+                    case 'r':
+                        for(int i = 0; i < hb_list_count(handle_list); i++) {
+                            hb_handle_t* h = hb_list_item(handle_list, i);
+                            hb_system_sleep_prevent(h);
+                            hb_resume(h);
+                        }
+                        break;
+                    case 'h':
+                        ShowCommands();
+                        break;
+                }
+            }
+        }
+#endif
+        hb_snooze(100);
+
+        for(int i = 0; i < hb_list_count(handle_list); i++) {
+            hb_handle_t* h = hb_list_item(handle_list, i);
+
+            hb_dict_set(preset_dict, "ChunkIndex", hb_value_int(i));
+            HandleEvents( h, preset_dict );
+        }
+    }
+    job_running[chunk_idx? hb_value_get_int(chunk_idx): 0LL] = 0;
 }
 
 int RunQueueJob(hb_handle_t *h, hb_dict_t *job_dict)
@@ -447,7 +738,7 @@ int RunQueueJob(hb_handle_t *h, hb_dict_t *job_dict)
 
     hb_add_json(h, json_job);
     free(json_job);
-    job_running = 1;
+    job_running[0] = 1;
     hb_start( h );
 
     EventLoop(h, NULL);
@@ -597,8 +888,32 @@ int main( int argc, char ** argv )
         hb_scan2(h, input, titleindex, preview_count, store_previews,
                 min_title_duration * 90000LL, crop_threshold_frames, crop_threshold_pixels);
 
-        EventLoop(h, preset_dict);
-        hb_value_free(&preset_dict);
+        if (num_chunks) {
+            fprintf( stderr, "Num chunks: %d\n", num_chunks );
+            if (input) {
+                hb_list_t* handle_list = hb_list_init();
+                hb_list_add(handle_list, h);
+                hb_system_sleep_prevent(h);
+                for( int c = 1; c < num_chunks; c++ ) {
+                    hb_handle_t* handle = hb_init(debug);
+                    hb_scan2(handle, input, titleindex, preview_count, store_previews,
+                            min_title_duration * 90000LL, crop_threshold_frames, crop_threshold_pixels);
+                    hb_list_add(handle_list, handle);
+                    hb_system_sleep_prevent(handle);
+                }
+                MultiEventLoop(handle_list, preset_dict);
+                glueTogetherFragments(output, num_chunks);
+
+                // TODO
+                /*for( int c = 1; c < num_chunks; c++ ) {*/
+                    /*hb_close(hb_list_item(handle_list, c));*/
+                /*}*/
+                /*hb_list_close(&handle_list);*/
+            }
+        } else {
+            EventLoop(h, preset_dict);
+        }
+        /*hb_value_free(&preset_dict);*/
     }
 
 cleanup:
@@ -860,6 +1175,8 @@ static int HandleEvents(hb_handle_t * h, hb_dict_t *preset_dict)
 {
     hb_state_t s;
 
+    hb_value_t* chunk_idx = hb_dict_get(preset_dict, "ChunkIndex");
+
     hb_get_state( h, &s );
     switch( s.state )
     {
@@ -894,7 +1211,7 @@ static int HandleEvents(hb_handle_t * h, hb_dict_t *preset_dict)
             hb_title_set_t * title_set;
             hb_title_t * title;
 
-            if (job_running)
+            if (job_running[chunk_idx ?  hb_value_get_int(chunk_idx): 0ll])
             {
                 // SCANDONE generated by a scan during execution of the job
                 break;
@@ -989,7 +1306,7 @@ static int HandleEvents(hb_handle_t * h, hb_dict_t *preset_dict)
 
             hb_add_json(h, json_job);
             free(json_job);
-            job_running = 1;
+            job_running[chunk_idx ?  hb_value_get_int(chunk_idx): 0ll]  = 1;
             hb_start( h );
             break;
         }
@@ -1017,8 +1334,9 @@ static int HandleEvents(hb_handle_t * h, hb_dict_t *preset_dict)
                 show_progress_json(&s);
                 break;
             }
-            fprintf( stdout, "%sEncoding: task %d of %d, %.2f %%",
-                     stdout_sep, p.pass, p.pass_count, 100.0 * p.progress );
+
+            fprintf( stdout, "%sEncoding: task %d of %d, %.2f (chunk %lld) %%",
+                     stdout_sep, p.pass, p.pass_count, 100.0 * p.progress, chunk_idx ?  hb_value_get_int(chunk_idx): 0ll );
             if( p.seconds > -1 )
             {
                 fprintf( stdout, " (%.2f fps, avg %.2f fps, ETA "
@@ -1067,8 +1385,8 @@ static int HandleEvents(hb_handle_t * h, hb_dict_t *preset_dict)
                              p.error );
             }
             done_error = p.error;
-            work_done = 1;
-            job_running = 0;
+            work_done += 1;
+            job_running[chunk_idx ?  hb_value_get_int(chunk_idx): 0ll ] = 0;
             break;
 #undef p
     }
@@ -2217,6 +2535,7 @@ static int ParseOptions( int argc, char ** argv )
     #define CROP_THRESHOLD_FRAMES         329
     #define CROP_MODE                     330
     #define HW_DECODE                     331
+    #define NUM_CHUNKS                    332
     
     for( ;; )
     {
@@ -2401,6 +2720,7 @@ static int ParseOptions( int argc, char ** argv )
             { "audio-copy-mask", required_argument, NULL, ALLOWED_AUDIO_COPY },
             { "audio-fallback",  required_argument, NULL, AUDIO_FALLBACK },
             { "json",        no_argument,       NULL,    JSON_LOGGING },
+            { "chunks",       required_argument,       NULL,    NUM_CHUNKS },
             { 0, 0, 0, 0 }
           };
 
@@ -3189,13 +3509,16 @@ static int ParseOptions( int argc, char ** argv )
                 if( optarg != NULL )
                 {
                     if( !strcmp( optarg, "nvdec" ) ) {
-                        hw_decode = 4;
+                        hw_decode = HB_DECODE_SUPPORT_NVDEC;
                     }
                     else
                     {
                         hw_decode = 0;
                     }
                 } break;
+            case NUM_CHUNKS:
+                num_chunks = atoi(optarg);
+                break;
             case ':':
                 fprintf( stderr, "missing parameter (%s)\n", argv[cur_optind] );
                 return -1;
@@ -4851,7 +5174,19 @@ PrepareJob(hb_handle_t *h, hb_title_t *title, hb_dict_t *preset_dict)
         write_chapter_names(job_dict, marker_file);
     }
 
-    hb_dict_set(dest_dict, "File", hb_value_string(output));
+    hb_value_t* chunk_index = hb_dict_get(preset_dict, "ChunkIndex");
+
+    if (chunk_index) {
+        #define BUFFER_SIZE (4092*10)
+        char buffer[BUFFER_SIZE];
+        int i = hb_value_get_int(chunk_index);
+        snprintf(buffer, BUFFER_SIZE, "%s.%d.ts", output, i);
+        buffer[BUFFER_SIZE - 1] = '\0';
+        #undef BUFFER_SIZE
+        hb_dict_set(dest_dict, "File", hb_value_string(buffer));
+    } else {
+        hb_dict_set(dest_dict, "File", hb_value_string(output));
+    }
 
     // Now that the job is initialized, we need to find out
     // what muxer is being used.
@@ -4913,6 +5248,19 @@ PrepareJob(hb_handle_t *h, hb_title_t *title, hb_dict_t *preset_dict)
         if (range_seek_points)
             hb_dict_set(range_dict, "SeekPoints",
                     hb_value_int(range_seek_points));
+    }
+    if (chunk_index) {
+        int64_t i = hb_value_get_int(chunk_index);
+        hb_dict_t *range_dict = hb_dict_get(
+                            hb_dict_get(job_dict, "Source"), "Range");
+        
+        int64_t pts_per_cunk = title->duration / num_chunks;
+        hb_dict_set(range_dict, "Start", hb_value_int(i * pts_per_cunk));
+        if (i != num_chunks - 1) {
+            hb_dict_set(range_dict, "End", hb_value_int((i + 1) * pts_per_cunk));
+        } else {
+            hb_dict_remove(range_dict, "End");
+        }
     }
 
     if (angle)
